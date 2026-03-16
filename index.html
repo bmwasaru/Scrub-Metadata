@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scrub Metadata</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.3/dist/heic2any.min.js"></script>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#2563eb">
+</head>
+<body class="bg-slate-50 min-h-screen flex flex-col items-center p-4 md:p-10 font-sans">
+
+    <header class="text-center mb-10">
+        <h1 class="text-4xl font-extrabold text-slate-800 tracking-tight text-blue-600">Scrub Metadata</h1>
+        <p class="text-slate-500 mt-2 text-sm">Supporting JPEG, PNG, WEBP, and <b>HEIC</b> (iPhone).</p>
+        <div id="stats-banner" class="hidden mt-4 inline-block bg-green-600 text-white px-4 py-1 rounded-full text-xs font-bold shadow-sm">
+            Total Tags Scrubbed: <span id="total-tags">0</span>
+        </div>
+    </header>
+
+    <main class="w-full max-w-2xl bg-white rounded-3xl shadow-2xl overflow-hidden border border-slate-100">
+        <div id="drop-zone" class="relative m-6 border-4 border-dashed border-slate-200 rounded-2xl p-12 transition-all flex flex-col items-center justify-center hover:border-blue-400 hover:bg-blue-50 group">
+            <input type="file" id="file-input" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" multiple accept="image/jpeg, image/png, image/webp, image/heic, .heic">
+            <div class="bg-blue-100 p-4 rounded-full mb-4 text-blue-600 group-hover:scale-110 transition-transform">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+            </div>
+            <p class="text-lg font-semibold text-slate-700 pointer-events-none text-center">
+                Drop photos here or <span class="text-blue-600">click to browse</span>
+            </p>
+        </div>
+
+        <div id="status-container" class="px-8 pb-8 space-y-4 hidden">
+            <div class="flex justify-between items-center border-b pb-4">
+                <h3 class="font-bold text-slate-800 uppercase tracking-wider text-[10px] font-mono">Status Queue</h3>
+                <button id="download-all" class="bg-blue-600 text-white text-[10px] font-bold px-4 py-2 rounded-lg hover:bg-blue-700 transition active:scale-95 shadow-md hidden">
+                    Download Zip Package
+                </button>
+            </div>
+            <ul id="file-list" class="max-h-72 overflow-y-auto divide-y divide-slate-100"></ul>
+        </div>
+    </main>
+
+    <div id="error-console" class="hidden w-full max-w-2xl mt-6 p-4 bg-slate-900 rounded-xl shadow-inner">
+        <h4 class="text-slate-400 font-bold text-[10px] uppercase mb-2 border-b border-slate-800 pb-1">Debug Terminal</h4>
+        <div id="error-logs" class="text-[10px] font-mono text-green-400 max-h-40 overflow-y-auto leading-relaxed"></div>
+    </div>
+
+    <footer class="mt-8 text-slate-400 text-xs text-center max-w-md">
+        Files are processed in your browser memory via the Canvas API. <br>
+        <strong>No data is ever sent to a server.</strong>
+    </footer>
+
+    <script>
+        const fileInput = document.getElementById('file-input');
+        const fileList = document.getElementById('file-list');
+        const statusContainer = document.getElementById('status-container');
+        const totalTagsEl = document.getElementById('total-tags');
+        const statsBanner = document.getElementById('stats-banner');
+        const downloadAllBtn = document.getElementById('download-all');
+        const errorConsole = document.getElementById('error-console');
+        const errorLogs = document.getElementById('error-logs');
+        
+        let processedMap = new Map(); 
+        let grandTotalTags = 0;
+
+        function logStatus(msg, isError = false) {
+            errorConsole.classList.remove('hidden');
+            const entry = document.createElement('div');
+            entry.className = isError ? "text-red-400" : "text-green-400";
+            entry.textContent = `> ${new Date().toLocaleTimeString()}: ${msg}`;
+            errorLogs.prepend(entry);
+        }
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) handleFiles(e.target.files);
+        });
+
+        async function handleFiles(files) {
+            statusContainer.classList.remove('hidden');
+            
+            for (const file of Array.from(files)) {
+                // Support HEIC and standard images
+                const isHeic = file.name.toLowerCase().endsWith('.heic') || file.type === 'image/heic';
+                if (!file.type.startsWith('image/') && !isHeic) continue;
+
+                const ext = isHeic ? 'jpg' : file.name.split('.').pop();
+                const uuidName = `${crypto.randomUUID()}.${ext}`;
+                const fileId = 'f-' + Math.random().toString(36).substr(2, 9);
+                
+                addFileToUI(file.name, uuidName, fileId);
+
+                try {
+                    // 1. Get metadata
+                    const tagCount = await getMetadataCount(file);
+                    
+                    // 2. Process
+                    let blobToProcess = file;
+                    if (isHeic) {
+                        logStatus(`Converting HEIC to JPEG...`);
+                        const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.8 });
+                        blobToProcess = Array.isArray(converted) ? converted[0] : converted;
+                    }
+
+                    const arrayBuffer = await blobToProcess.arrayBuffer();
+                    const cleanBlob = await stripMetadataFromBuffer(arrayBuffer, "image/jpeg");
+                    
+                    processedMap.set(uuidName, cleanBlob);
+                    updateFileUI(fileId, uuidName, cleanBlob, tagCount);
+                    
+                    grandTotalTags += tagCount;
+                    totalTagsEl.textContent = grandTotalTags;
+                    statsBanner.classList.remove('hidden');
+                    logStatus(`Success: ${uuidName}`);
+
+                } catch (err) {
+                    logStatus(`Error [${file.name}]: ${err.message}`, true);
+                    const li = document.getElementById(fileId);
+                    if(li) li.querySelector('.status').innerHTML = `<span class="text-red-500 font-bold text-[10px]">FAILED</span>`;
+                }
+            }
+            if (processedMap.size > 1) downloadAllBtn.classList.remove('hidden');
+        }
+
+        function getMetadataCount(file) {
+            return new Promise((resolve) => {
+                const timeout = setTimeout(() => resolve(0), 1000);
+                EXIF.getData(file, function() {
+                    clearTimeout(timeout);
+                    const tags = EXIF.getAllTags(this);
+                    resolve(Object.keys(tags || {}).length);
+                });
+            });
+        }
+
+        async function stripMetadataFromBuffer(buffer, mimeType) {
+            return new Promise((resolve, reject) => {
+                const blob = new Blob([buffer], { type: mimeType });
+                const url = URL.createObjectURL(blob);
+                const img = new Image();
+                
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    URL.revokeObjectURL(url);
+                    canvas.toBlob((result) => resolve(result), "image/jpeg", 0.9);
+                };
+                img.onerror = () => reject(new Error("Image decode failed"));
+                img.src = url;
+            });
+        }
+
+        function addFileToUI(originalName, uuidName, id) {
+            const li = document.createElement('li');
+            li.id = id;
+            li.className = "py-4 flex justify-between items-center animate-pulse";
+            li.innerHTML = `
+                <div class="truncate pr-4">
+                    <p class="text-[9px] text-slate-400 font-mono truncate w-40">${originalName}</p>
+                    <p class="text-xs font-semibold text-slate-700 truncate">${uuidName}</p>
+                </div>
+                <div class="status text-[10px] text-slate-300 italic">Processing...</div>
+            `;
+            fileList.prepend(li);
+        }
+
+        function updateFileUI(id, uuidName, blob, tagCount) {
+            const li = document.getElementById(id);
+            if (!li) return;
+            li.classList.remove('animate-pulse');
+            const url = URL.createObjectURL(blob);
+            li.querySelector('.status').innerHTML = `
+                <div class="flex flex-col items-end">
+                    <span class="text-[8px] font-bold text-orange-500 mb-1 tracking-tighter">${tagCount} TAGS REMOVED</span>
+                    <a href="${url}" download="${uuidName}" class="bg-blue-600 text-white text-[9px] font-bold px-2 py-1 rounded shadow-sm hover:bg-blue-700 transition">SAVE</a>
+                </div>
+            `;
+        }
+
+        downloadAllBtn.addEventListener('click', async () => {
+            try {
+                downloadAllBtn.textContent = "Packing Zip...";
+                downloadAllBtn.disabled = true;
+                const zip = new JSZip();
+                for (let [name, blob] of processedMap) {
+                    const buffer = await blob.arrayBuffer();
+                    zip.file(name, buffer, { binary: true });
+                }
+                const content = await zip.generateAsync({ type: "blob" });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(content);
+                link.download = `scrubbed_package.zip`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                downloadAllBtn.textContent = "Download Zip Package";
+                downloadAllBtn.disabled = false;
+            } catch (err) {
+                logStatus(`Zip Error: ${err.message}`, true);
+                downloadAllBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
