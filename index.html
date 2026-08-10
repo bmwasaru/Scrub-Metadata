@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Scrub Metadata</title>
+    <title>Futa - Erase Metadata</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/exifreader@4.41.3/dist/exif-reader.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.3/dist/heic2any.min.js"></script>
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#2563eb">
@@ -14,7 +14,7 @@
 <body class="bg-slate-50 min-h-screen flex flex-col items-center p-4 md:p-10 font-sans">
 
     <header class="text-center mb-10">
-        <h1 class="text-4xl font-extrabold text-slate-800 tracking-tight text-blue-600">Scrub Metadata</h1>
+        <h1 class="text-4xl font-extrabold text-slate-800 tracking-tight text-blue-600">Futa - Erase Metadata</h1>
         <p class="text-slate-500 mt-2 text-sm">Supporting JPEG, PNG, WEBP, and <b>HEIC</b> (iPhone).</p>
         <div id="stats-banner" class="hidden mt-4 inline-block bg-green-600 text-white px-4 py-1 rounded-full text-xs font-bold shadow-sm">
             Total Tags Scrubbed: <span id="total-tags">0</span>
@@ -100,14 +100,47 @@
                     
                     // 2. Process
                     let blobToProcess = file;
+                    let outputMimeType = file.type;
+
                     if (isHeic) {
                         logStatus(`Converting HEIC to JPEG...`);
-                        const converted = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.8 });
-                        blobToProcess = Array.isArray(converted) ? converted[0] : converted;
+
+                        const converted = await heic2any({
+                            blob: file,
+                            toType: "image/jpeg",
+                            quality: 0.8
+                        });
+
+                        blobToProcess = Array.isArray(converted)
+                            ? converted[0]
+                            : converted;
+
+                        outputMimeType = "image/jpeg";
+                    }
+
+                    if (!outputMimeType) {
+                        const extension = file.name
+                            .split('.')
+                            .pop()
+                            .toLowerCase();
+
+                        const mimeTypes = {
+                            jpg: "image/jpeg",
+                            jpeg: "image/jpeg",
+                            png: "image/png",
+                            webp: "image/webp"
+                        };
+
+                        outputMimeType = mimeTypes[extension] || "image/jpeg";
                     }
 
                     const arrayBuffer = await blobToProcess.arrayBuffer();
-                    const cleanBlob = await stripMetadataFromBuffer(arrayBuffer, "image/jpeg");
+
+                    const cleanBlob = await stripMetadataFromBuffer(
+                        arrayBuffer,
+                        blobToProcess.type || outputMimeType,
+                        outputMimeType
+                    );
                     
                     processedMap.set(uuidName, cleanBlob);
                     updateFileUI(fileId, uuidName, cleanBlob, tagCount);
@@ -126,33 +159,126 @@
             if (processedMap.size > 1) downloadAllBtn.classList.remove('hidden');
         }
 
-        function getMetadataCount(file) {
-            return new Promise((resolve) => {
-                const timeout = setTimeout(() => resolve(0), 1000);
-                EXIF.getData(file, function() {
-                    clearTimeout(timeout);
-                    const tags = EXIF.getAllTags(this);
-                    resolve(Object.keys(tags || {}).length);
-                });
-            });
+        function countTagGroup(group) {
+            if (!group || typeof group !== 'object') {
+                return 0;
+            }
+
+            return Object.keys(group)
+                .filter((key) => key !== '_raw')
+                .length;
         }
 
-        async function stripMetadataFromBuffer(buffer, mimeType) {
+        async function getMetadataCount(file) {
+            try {
+                const tags = await ExifReader.load(file, {
+                    expanded: true,
+                    includeUnknown: true
+                });
+
+                const metadataGroups = [
+                    'exif',
+                    'iptc',
+                    'xmp',
+                    'icc',
+                    'photoshop',
+                    'makerNotes',
+                    'pngText'
+                ];
+
+                let count = metadataGroups.reduce(
+                    (total, group) => total + countTagGroup(tags[group]),
+                    0
+                );
+
+                // Embedded EXIF thumbnails are also removed by Canvas.
+                if (tags.Thumbnail) {
+                    count += 1;
+                }
+
+                return count;
+            } catch (error) {
+                /*
+                * MetadataMissingError simply means the image does not
+                * contain metadata that ExifReader understands.
+                */
+                if (
+                    ExifReader.errors &&
+                    error instanceof ExifReader.errors.MetadataMissingError
+                ) {
+                    return 0;
+                }
+
+                logStatus(
+                    `Metadata read warning [${file.name}]: ${error.message}`,
+                    true
+                );
+
+                return 0;
+            }
+        }
+
+        async function stripMetadataFromBuffer(
+            buffer,
+            inputMimeType,
+            outputMimeType
+        ) {
             return new Promise((resolve, reject) => {
-                const blob = new Blob([buffer], { type: mimeType });
+                const blob = new Blob(
+                    [buffer],
+                    { type: inputMimeType }
+                );
+
                 const url = URL.createObjectURL(blob);
                 const img = new Image();
-                
+
                 img.onload = () => {
                     const canvas = document.createElement('canvas');
-                    canvas.width = img.width;
-                    canvas.height = img.height;
+
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+
                     const ctx = canvas.getContext('2d');
+
+                    if (!ctx) {
+                        URL.revokeObjectURL(url);
+                        reject(new Error("Could not create canvas context"));
+                        return;
+                    }
+
                     ctx.drawImage(img, 0, 0);
+
                     URL.revokeObjectURL(url);
-                    canvas.toBlob((result) => resolve(result), "image/jpeg", 0.9);
+
+                    const quality =
+                        outputMimeType === "image/jpeg" ||
+                        outputMimeType === "image/webp"
+                            ? 0.9
+                            : undefined;
+
+                    canvas.toBlob(
+                        (result) => {
+                            if (!result) {
+                                reject(
+                                    new Error(
+                                        `Could not encode ${outputMimeType}`
+                                    )
+                                );
+                                return;
+                            }
+
+                            resolve(result);
+                        },
+                        outputMimeType,
+                        quality
+                    );
                 };
-                img.onerror = () => reject(new Error("Image decode failed"));
+
+                img.onerror = () => {
+                    URL.revokeObjectURL(url);
+                    reject(new Error("Image decode failed"));
+                };
+
                 img.src = url;
             });
         }
